@@ -83,7 +83,7 @@ export async function testKey(key, { signal, fetchFn } = {}) {
 export async function readStream(body, onProgress, key) {
   const reader = body.getReader(), dec = new TextDecoder();
   const blocks = new Map();
-  let buf = '', text = '', stop = null, chars = 0;
+  let buf = '', text = '', stop = null, chars = 0, sawStop = false;
   const block = (i) => { if (!blocks.has(i)) blocks.set(i, { type: 'other', name: '', json: '' }); return blocks.get(i); };
   const handle = (chunk) => {
     const data = chunk.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).replace(/^ /, '')).join('\n');
@@ -95,7 +95,11 @@ export async function readStream(body, onProgress, key) {
       else if (ev.delta.type === 'text_delta') { text += ev.delta.text; chars += ev.delta.text.length; }
       if (onProgress) onProgress(chars);
     } else if (ev.type === 'message_delta') { if (ev.delta && ev.delta.stop_reason) stop = ev.delta.stop_reason; }
-    else if (ev.type === 'error') throw new Error(scrub(`Anthropic API error: ${ev.error && ev.error.message}`, key));
+    else if (ev.type === 'message_stop') sawStop = true;
+    else if (ev.type === 'error') {
+      const kind = ev.error && ev.error.type;
+      throw new StreamError(scrub(`Anthropic API error: ${(ev.error && ev.error.message) || kind}`, key), ['overloaded_error', 'api_error', 'rate_limit_error'].includes(kind));
+    }
   };
   for (;;) {
     const { value, done } = await reader.read();
@@ -106,7 +110,12 @@ export async function readStream(body, onProgress, key) {
   }
   buf += dec.decode();
   if (buf.trim()) handle(buf);
-  return { blocks: [...blocks.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]), text, stop };
+  return { blocks: [...blocks.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]), text, stop, complete: sawStop || stop !== null };
+}
+
+/** A failure inside an otherwise successful (200) stream: overloads and dropped connections are worth retrying. */
+export class StreamError extends Error {
+  constructor(message, retryable) { super(message); this.name = 'StreamError'; this.retryable = retryable; }
 }
 
 /** Errors the loop can recover from by asking again (the model answered in words, or ran out of room). */
@@ -114,24 +123,39 @@ export class NoModelError extends Error {
   constructor(message, kind, said = '') { super(message); this.name = 'NoModelError'; this.kind = kind; this.said = said; }
 }
 
-/** One streamed request. Resolves to the submitted spec object. */
+/** One streamed request. Resolves to the submitted spec object. Retries HTTP failures AND stream-level overloads/dropped connections. */
 export async function requestSpec({ key, model, messages, signal, onProgress, onRetry, fetchFn, opts = {} }) {
-  const res = await fetchRetry(API_URL, {
-    method: 'POST', headers: headers(key),
-    body: JSON.stringify({ model, max_tokens: 24000, stream: true, system: systemPrompt(opts), tools: [TOOL], tool_choice: { type: 'auto', disable_parallel_tool_use: true }, messages }),
-  }, { signal, fetchFn, onRetry });
-  if (!res.ok) throw await apiError(res, key);
-  const { blocks, text, stop } = await readStream(res.body, onProgress, key);
-  if (stop === 'refusal') throw new Error('The model declined this request.');
-  let spec = null;
-  const tool = blocks.find((b) => b.type === 'tool_use' && b.name === 'submit_model' && b.json);
-  if (tool) { try { spec = JSON.parse(tool.json); } catch { /* cut off or broken: handled below */ } }
-  if (!spec) spec = extractJson(text);
-  if (spec && typeof spec === 'object') return spec;
-  if (stop === 'max_tokens') throw new NoModelError('The answer was cut off (too long).', 'cut-off');
-  const said = scrub(text.trim().slice(0, 300), key);
-  throw new NoModelError('The model did not return a usable shape description.' + (said ? ` It said: "${said.slice(0, 160)}"` : ''), 'no-model', said);
+  const body = JSON.stringify({ model, max_tokens: 24000, stream: true, system: systemPrompt(opts), tools: [TOOL], tool_choice: { type: 'auto', disable_parallel_tool_use: true }, messages });
+  const usable = (v) => (v && typeof v === 'object' && Array.isArray(v.shapes) ? v : null); // a fragment of a cut-off answer is not a model
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetchRetry(API_URL, { method: 'POST', headers: headers(key), body }, { signal, fetchFn, onRetry });
+    if (!res.ok) throw await apiError(res, key);
+    let streamed;
+    try {
+      streamed = await readStream(res.body, onProgress, key);
+      if (!streamed.complete && !(streamed.blocks.some((b) => b.type === 'tool_use' && usable(safeParse(b.json))))) throw new StreamError('The connection dropped before the answer finished.', true);
+    } catch (e) {
+      const retryable = e instanceof StreamError ? e.retryable : (e && e.name !== 'AbortError' && e instanceof TypeError); // network failure while reading
+      if (!retryable || attempt >= 2) throw e;
+      const wait = Math.min(2 ** attempt * 1500, 12000);
+      if (onRetry) onRetry(attempt + 1, 'stream', wait);
+      await sleep(wait, signal);
+      continue;
+    }
+    const { blocks, text, stop } = streamed;
+    if (stop === 'refusal') throw new Error('The model declined this request.');
+    let spec = null;
+    const tool = blocks.find((b) => b.type === 'tool_use' && b.name === 'submit_model' && b.json);
+    if (tool) spec = usable(safeParse(tool.json));
+    if (!spec) spec = usable(extractJson(text));
+    if (spec) return spec;
+    if (stop === 'max_tokens') throw new NoModelError('The answer was cut off (too long).', 'cut-off');
+    const said = scrub(text.trim().slice(0, 300), key);
+    throw new NoModelError('The model did not return a usable shape description.' + (said ? ` It said: "${said.slice(0, 160)}"` : ''), 'no-model', said);
+  }
 }
+
+function safeParse(t) { try { return JSON.parse(t); } catch { return null; } }
 
 /**
  * Ask -> build -> check -> (send problems back) x maxRounds.
@@ -139,23 +163,29 @@ export async function requestSpec({ key, model, messages, signal, onProgress, on
  */
 export async function generate({ prompt, image, key, model, signal, onEvent = () => {}, maxRounds = 3, request = requestSpec, build = buildModel, opts = {} }) {
   const messages = [{ role: 'user', content: userContent(prompt, image) }];
-  let lastSpec = null;
+  const attempts = []; // { spec, problems } of every round so far
   for (let round = 1; round <= maxRounds; round++) {
     onEvent({ type: 'ask', round, repair: round > 1 });
     let spec;
     try {
       spec = await askWithNudge({ request, key, model, messages, signal, opts, round, onEvent });
     } catch (e) {
-      // A later round failed (network, overload): keep the best earlier attempt instead of losing everything
-      if (round > 1 && lastSpec && !(e && e.name === 'AbortError')) {
-        const out = await build(lastSpec, { ...opts, prune: true });
-        if (out.ok) { onEvent({ type: 'fallback', round, message: e.message }); return { ...out, spec: lastSpec, rounds: round - 1, apiFailure: e.message }; }
+      // A later round failed (network, overload): fall back to the best earlier attempt instead of losing everything
+      if (round > 1 && attempts.length && !(e && e.name === 'AbortError')) {
+        const ranked = attempts.slice().sort((a, b) => a.problems - b.problems || b.round - a.round); // fewest problems first, then newest
+        for (const a of ranked) {
+          const out = await build(a.spec, { ...opts, prune: true });
+          if (out.ok) {
+            onEvent({ type: 'fallback', round, message: e.message, pruned: !!out.pruned, fromRound: a.round });
+            return { ...out, spec: a.spec, rounds: a.round, apiFailure: e.message };
+          }
+        }
       }
       throw e;
     }
-    lastSpec = spec;
     const last = round === maxRounds;
     const out = await build(spec, { ...opts, prune: last });
+    attempts.push({ spec, round, problems: out.ok ? 0 : out.problems.length });
     onEvent({ type: 'built', round, ok: out.ok, problems: out.problems, warnings: out.warnings, spec, model: out.model, pruned: !!out.pruned, prunedProblems: out.prunedProblems });
     if (out.ok) return { ...out, spec, rounds: round };
     if (last) return { ...out, spec, rounds: round };

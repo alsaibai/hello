@@ -18,7 +18,7 @@ async function readImage(file) {
     src = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('That file is not an image.')); i.src = r.result; }; r.onerror = () => rej(new Error('Could not read that file.')); r.readAsDataURL(file); });
   }
   const k = Math.min(1, 1024 / Math.max(src.width, src.height));
-  const c = document.createElement('canvas'); c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+  const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(src.width * k)); c.height = Math.max(1, Math.round(src.height * k));
   const g = c.getContext('2d');
   g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); // JPEG has no alpha: transparent pixels would otherwise turn black
   g.drawImage(src, 0, 0, c.width, c.height);
@@ -56,7 +56,7 @@ export default function App() {
   const token = useRef(0), cur = useRef(null); // cur = what is on screen, so options can rebuild it
   const viewer = useRef(null), abort = useRef(null), fileIn = useRef(null);
 
-  const show = useCallback((m, src, id = '', raw = null) => { setModel(m); setSource(src); setPresetId(id); setStep(0); setError(''); cur.current = { raw, src, id, mosaic: m && m.mosaic, m }; }, []);
+  const show = useCallback((m, src, id = '', raw = null, mosaic = null) => { setModel(m); setSource(src); setPresetId(id); setStep(0); setError(''); cur.current = { raw, src, id, mosaic, m, prune: !!(m && m.removedGroups) }; }, []);
 
   /** Build (in the worker) and show. Stale results from a slower earlier build are dropped. */
   const buildShow = useCallback(async (raw, src, id, o) => {
@@ -66,7 +66,7 @@ export default function App() {
       const r = await buildAsync(raw, o);
       if (t !== token.current) return null;
       if (!r.ok) { setError(`"${src}" failed its checks:\n` + r.problems.join('\n')); return r; }
-      show(r.model, src, id, raw);
+      show(r.model, src, id, raw, null);
       return r;
     } catch (e) { if (t === token.current) setError(e.message); return null; }
     finally { if (t === token.current) setBuilding(false); }
@@ -79,7 +79,11 @@ export default function App() {
     else if (kind === 'baseplate') { setBaseplate(v); store.set('bf.base', v ? '1' : ''); }
     else { setCommonOnly(v); store.set('bf.common', v ? '1' : ''); }
     const c = cur.current;
-    if (c && c.raw && !c.mosaic) buildShow(c.raw, c.src, c.id, o);
+    if (!c) return;
+    if (c.mosaic) { // a picture mosaic can get tiles and a baseplate too
+      const t = ++token.current; setBuilding(true);
+      buildGridAsync(c.mosaic.grid, c.mosaic.name, o).then((r) => { if (t !== token.current) return; if (r.ok) show(r.model, c.src, '', null, c.mosaic); else setError(r.problems.join('\n')); }).catch((e) => setError(e.message)).finally(() => { if (t === token.current) setBuilding(false); });
+    } else if (c.raw) buildShow(c.raw, c.src, c.id, c.prune ? { ...o, prune: true } : o); // a result that needed loose bits removed must be rebuilt the same way
   };
   useEffect(() => { loadPreset(PRESETS[0], { tiles: store.get('bf.tiles') === '1', commonOnly: store.get('bf.common') === '1', baseplate: store.get('bf.base') === '1' }); }, [loadPreset]);
   useEffect(() => { window.__brick = { get viewer() { return viewer.current; }, get model() { return model; } }; });
@@ -106,8 +110,8 @@ export default function App() {
         onEvent: (e) => {
           if (e.type === 'ask') add({ text: e.repair ? `round ${e.round}: sending problems back to Claude…` : `round ${e.round}: asking Claude to describe shapes…` });
           else if (e.type === 'nudge') add({ text: `round ${e.round}: ${e.kind === 'cut-off' ? 'answer was cut off, asking for a shorter one…' : 'Claude answered in words, asking it to send the shapes…'}` });
-          else if (e.type === 'fallback') add({ text: `round ${e.round}: API failed (${e.message.slice(0, 80)}); kept the previous attempt`, cls: 'bad' });
-          else if (e.type === 'retry') add({ text: `round ${e.round}: ${e.why === 'network' ? 'connection dropped' : 'API busy (' + e.why + ')'}, retrying in ${Math.round(e.ms / 1000)}s…` });
+          else if (e.type === 'fallback') add({ text: `round ${e.round}: API failed (${e.message.slice(0, 80)}); using the ${e.pruned ? 'repaired (loose pieces removed) ' : ''}result of round ${e.fromRound}`, cls: 'bad' });
+          else if (e.type === 'retry') add({ text: `round ${e.round}: ${e.why === 'network' || e.why === 'stream' ? 'connection dropped or API overloaded' : 'API busy (' + e.why + ')'}, retrying in ${Math.round(e.ms / 1000)}s…` });
           else if (e.type === 'progress') setLog((x) => { const y = x.slice(); const last = y[y.length - 1]; if (last && last.text.startsWith('round')) y[y.length - 1] = { ...last, text: last.text.replace(/ \(\d+ chars\)$/, '') + ` (${e.chars} chars)` }; return y; });
           else if (e.type === 'built') {
             const n = e.spec.shapes ? e.spec.shapes.length : 0;
@@ -117,7 +121,7 @@ export default function App() {
           }
         },
       });
-      if (res.ok) { show(res.model, `AI · ${res.model.name} · ${res.rounds} round${res.rounds > 1 ? 's' : ''}`, '', res.spec); setMode('model'); }
+      if (res.ok) { show(res.model, `AI · ${res.model.name} · ${res.rounds} round${res.rounds > 1 ? 's' : ''}${res.model.removedGroups ? ' · loose pieces removed' : ''}`, '', res.spec); setMode('model'); }
       else setError('Claude could not produce a buildable model after 3 rounds. Last problems:\n' + res.problems.join('\n'));
     } catch (e) {
       setError(e.name === 'AbortError' ? 'Cancelled.' : e.message);
@@ -133,15 +137,28 @@ export default function App() {
   const makeMosaic = async () => {
     if (!image) return;
     setBuilding(true); setError(''); setLog([]);
+    const t = ++token.current;
     try {
       const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Could not read the picture.')); i.src = image.url; });
       const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
       const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0);
-      const { grid, colors } = mosaicGrid(ctx.getImageData(0, 0, c.width, c.height), { cols: mosaicCols });
-      const r = await buildGridAsync(grid, 'Photo mosaic', opts);
-      if (!r.ok) { setError(r.problems.join('\n')); return; }
-      show(r.model, `mosaic · ${grid.W}×${grid.D} studs · ${colors.length} colours`); setMode('model');
-    } catch (e) { setError(e.message); } finally { setBuilding(false); }
+      const pixels = ctx.getImageData(0, 0, c.width, c.height);
+      // too many parts? try without dithering, then fewer studs, and say what was done
+      const tries = [[mosaicCols, true], [mosaicCols, false], ...[40, 32, 24, 16].filter((n) => n < mosaicCols).map((n) => [n, false])];
+      let last = null;
+      for (const [cols, dither] of tries) {
+        const { grid, colors } = mosaicGrid(pixels, { cols, dither });
+        const r = await buildGridAsync(grid, 'Photo mosaic', opts);
+        if (t !== token.current) return;
+        last = r;
+        if (r.ok) {
+          const note = cols !== mosaicCols ? ` · reduced from ${mosaicCols} studs (too many parts)` : !dither ? ' · dithering off (too many parts)' : '';
+          show(r.model, `mosaic · ${grid.W}×${grid.D} studs · ${colors.length} colours${note}`, '', null, { grid, name: 'Photo mosaic' }); setMode('model');
+          return;
+        }
+      }
+      setError(last.problems.join('\n'));
+    } catch (e) { setError(e.message); } finally { if (t === token.current) setBuilding(false); }
   };
 
   const drop = (e) => { e.preventDefault(); setOver(false); pick(e.dataTransfer.files[0]); };
@@ -182,9 +199,9 @@ export default function App() {
               </select>
             </div>
             <div className="opts">
-              <label><input type="checkbox" checked={tiles} onChange={(e) => setOpt('tiles', e.target.checked)} data-testid="opt-tiles" /> Smooth tops (tiles)</label>
-              <label><input type="checkbox" checked={baseplate} onChange={(e) => setOpt('baseplate', e.target.checked)} data-testid="opt-base" /> Build on a baseplate</label>
-              <label><input type="checkbox" checked={commonOnly} onChange={(e) => setOpt('commonOnly', e.target.checked)} data-testid="opt-common" /> Common colours only</label>
+              <label><input type="checkbox" checked={tiles} onChange={(e) => setOpt('tiles', e.target.checked)} disabled={busy || building} data-testid="opt-tiles" /> Smooth tops (tiles)</label>
+              <label><input type="checkbox" checked={baseplate} onChange={(e) => setOpt('baseplate', e.target.checked)} disabled={busy || building} data-testid="opt-base" /> Build on a baseplate</label>
+              <label><input type="checkbox" checked={commonOnly} onChange={(e) => setOpt('commonOnly', e.target.checked)} disabled={busy || building} data-testid="opt-common" /> Common colours only</label>
             </div>
             <div className="row" style={{ marginTop: 6 }}>
               <button className="btn pri grow" disabled={busy || (!prompt.trim() && !image)} onClick={run} data-testid="generate">{busy ? 'Working…' : key ? 'Generate' : 'Generate (needs key)'}</button>

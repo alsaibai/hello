@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildModel } from '../src/engine/pipeline.js';
 import { analyze } from '../src/engine/check.js';
 import { COLORS } from '../src/engine/palette.js';
+import { studCells } from '../src/engine/parts.js';
 
 // Random shape soups (every shape, op, mirror, option): buildModel must never throw, always explain a rejection,
 // and every model it accepts must satisfy the invariants.
@@ -34,6 +35,13 @@ describe('fuzz: random specs', () => {
       expect(an.overlap + an.uncovered + an.colorMismatch + an.outside).toBe(0);
       expect(m.check.stats.components).toBe(1);
       expect(m.steps.every((s) => s.parts.length >= 1 && s.parts.length <= 4)).toBe(true);
+      // only real catalogue parts: slopes have a direction and 2 x (1|2) footprint, tiles have no studs, nothing has NaN
+      for (const p of m.parts) {
+        expect(['brick', 'plate', 'tile', 'slope', 'baseplate']).toContain(p.kind);
+        if (p.kind === 'slope') { expect([1, 2, 3, 4]).toContain(p.dir); expect(Math.max(p.w, p.d)).toBe(2); expect([1, 2]).toContain(Math.min(p.w, p.d)); }
+        if (p.kind === 'tile') expect(studCells(p)).toEqual([]);
+        expect(Number.isFinite(p.x + p.y + p.z + p.w + p.d + p.h)).toBe(true);
+      }
       const placed = new Set();
       for (const p of m.parts.slice().sort((a, b) => a.order - b.order)) {
         expect(p.kind === 'baseplate' || p.y === 0 || an.adj[p.id].some((e) => placed.has(e.to))).toBe(true);

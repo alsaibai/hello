@@ -113,6 +113,23 @@ await page.screenshot({ path: out('mosaic-checks') });
 await page.click('[data-testid=mode-build]'); await page.fill('.stepbar input[type=range]', '30'); await settle(page, 900);
 await page.screenshot({ path: out('mosaic-build') });
 await page.click('[data-testid=mode-model]');
+// the options work on a mosaic too: smooth tops turns the picture layer into tiles
+await page.click('[data-testid=opt-tiles]'); await settle(page, 2500);
+ok('mosaic + smooth tops: still a mosaic, now with tiles', /mosaic/.test(await page.textContent('[data-testid=crumb]')));
+await page.click('[data-testid=tab-parts]'); await settle(page, 300);
+ok('mosaic parts list contains tiles', /Tile 1×1/.test(await page.textContent('[data-testid=parts-table]')));
+await page.screenshot({ path: out('mosaic-tiles') });
+await page.click('[data-testid=opt-tiles]'); await settle(page, 1500);
+// a noisy picture at 48 studs needs too many parts: the app falls back by itself and says so
+const noise = await page.evaluate(() => { const c = document.createElement('canvas'); c.width = 240; c.height = 240; const g = c.getContext('2d'); const d = g.createImageData(240, 240); for (let i = 0; i < d.data.length; i += 4) { d.data[i] = Math.random() * 255; d.data[i + 1] = Math.random() * 255; d.data[i + 2] = Math.random() * 255; d.data[i + 3] = 255; } g.putImageData(d, 0, 0); return c.toDataURL('image/png'); });
+await page.setInputFiles('[data-testid=file]', { name: 'noise.png', mimeType: 'image/png', buffer: Buffer.from(noise.split(',')[1], 'base64') });
+await settle(page, 600);
+await page.selectOption('select[aria-label="Mosaic width in studs"]', '48');
+await page.click('[data-testid=mosaic]'); await settle(page, 6000);
+const fb = await page.textContent('[data-testid=crumb]');
+ok('48-stud noise picture falls back automatically and says so', /mosaic/.test(fb) && /(dithering off|reduced from 48)/.test(fb) && !(await page.isVisible('[data-testid=error]')), fb);
+await page.click('[data-testid=mode-model]');
+await page.click('[data-testid=mode-model]');
 
 // stability warning shows in Checks
 await page.click('[data-testid=preset-cottage]'); await settle(page, 900);

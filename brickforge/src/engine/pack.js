@@ -187,6 +187,7 @@ function mergeSeams(a, b) {
 }
 
 function mk(kind, q, y, h) {
+  if (kind !== 'brick' && kind !== 'plate') throw new Error(`mk: cannot re-tile a ${kind}`);
   return { kind, x: q.x, z: q.z, w: q.w, d: q.d, y, h, color: q.c, no: partNo(kind, q.w, q.d), name: partName(kind, q.w, q.d) };
 }
 
@@ -337,7 +338,8 @@ export function repair(grid, parts, analyzeFn, seed = 1, deadline = Infinity) {
     }
     if (!done) {
       // fall back to re-tiling whole layers that contain loose parts, with many random tilings
-      const loose = cur.filter((P) => sizes(an)[an.comp[P.id]] < Math.max(...sizes(an)));
+      // only bricks and plates can be re-tiled: slopes have a direction and fixed sizes
+      const loose = cur.filter((P) => (P.kind === 'plate' || P.kind === 'brick') && sizes(an)[an.comp[P.id]] < Math.max(...sizes(an)));
       for (const P of loose) {
         if (Date.now() >= deadline) break;
         const same = cur.filter((S) => S.y === P.y && S.h === P.h && S.kind === P.kind);

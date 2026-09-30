@@ -187,7 +187,7 @@ export class Viewer {
 
   /** The baseplate is one big part: a slab with its studs, drawn on its own. */
   buildBaseplate(bp, ox, oz) {
-    if (this.baseGroup) { this.baseGroup.traverse((o) => { if (o.geometry && o.geometry !== studGeo) o.geometry.dispose(); }); this.scene.remove(this.baseGroup); if (this.baseMat) this.baseMat.dispose(); }
+    if (this.baseGroup) { this.baseGroup.traverse((o) => { if (o.geometry && o.geometry !== studGeo) o.geometry.dispose(); if (o.isInstancedMesh) o.dispose(); /* frees the per-instance buffer too */ }); this.scene.remove(this.baseGroup); if (this.baseMat) this.baseMat.dispose(); }
     this.baseGroup = null; this.baseMat = null; this.baseId = null; this.baseHighlight = false; this.floor.position.y = -0.001;
     if (!bp) return;
     const mat = this.bodyMat.clone(); mat.color.set(COLORS[bp.color].hex); mat.emissive = new THREE.Color(COLORS[bp.color].hex); mat.emissiveIntensity = 0;

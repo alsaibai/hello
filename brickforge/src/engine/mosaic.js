@@ -25,7 +25,9 @@ function nearest(r, g, b) {
  */
 export function mosaicGrid(pixels, { cols = 24, dither = true, maxRows = 48 } = {}) {
   const { width, height, data } = pixels;
-  const W = cols, D = Math.max(4, Math.min(maxRows, Math.round((cols * height) / width)));
+  let W = cols, D = Math.max(1, Math.round((cols * height) / width));
+  if (D > maxRows) { W = Math.max(4, Math.round((maxRows * width) / height)); D = maxRows; } // tall picture: narrow it instead of squashing it
+  W = Math.max(4, W); D = Math.max(4, D);
   // average the source pixels covered by each stud
   const cell = new Float32Array(W * D * 3);
   for (let z = 0; z < D; z++) for (let x = 0; x < W; x++) {

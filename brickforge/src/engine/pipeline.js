@@ -126,25 +126,36 @@ export function buildModel(raw, opts = {}) {
 /** A ready-made voxel grid (e.g. a picture mosaic) goes through the same pack -> check -> steps path. */
 export function buildFromGrid(grid, name, opts = {}) {
   const spec = { name, footprint: [grid.W, grid.D], shapes: [{ label: 'mosaic', shape: 'box' }] };
-  return finish(spec, grid, spec, opts);
+  return finish(spec, grid, spec, opts, { mosaic: true });
 }
 
-function finish(spec, grid, raw, opts) {
-  // Way over the part limit? Say so at once instead of optimising something that cannot be accepted.
-  const probeParts = pack(grid, 0, grid.slopePhase || 0), probe = probeParts.length;
-  if (probe > LIMITS.maxParts * 1.3) {
-    return { ok: false, warnings: [], problems: [`The model needs roughly ${probe} parts but the limit is ${LIMITS.maxParts}. Biggest: ${biggestShapes(probeParts, grid, spec)}. Make those smaller, use hollow:true, or replace curved shapes (much more expensive than boxes) with boxes.`] };
-  }
-  let { parts } = bestPack(grid);
+/** Tiles, baseplate, checks and stability warnings for a packed model (shared by the normal and the prune path). */
+function assemble(spec, grid, packed, opts) {
+  let parts = packed;
   if (opts.tiles) parts = applyTiles(parts, grid);
   if (opts.baseplate) parts = withBaseplate(parts, grid);
   const res = check(grid, parts, spec);
   if (res.ok) { const st = stability(parts, res.an, grid.offset); res.warnings.push(...st.warnings); }
+  return { parts, res };
+}
+
+function finish(spec, grid, raw, opts, extra = {}) {
+  const mosaic = !!extra.mosaic;
+  const advice = mosaic ? 'Choose fewer studs (or turn dithering off): a mosaic needs about one plate per stud where the picture changes colour.' : null;
+  // Way over the part limit? Say so at once instead of optimising something that cannot be accepted.
+  const probeParts = pack(grid, 0, grid.slopePhase || 0), probe = probeParts.length;
+  if (probe > LIMITS.maxParts * 1.3) {
+    return { ok: false, warnings: [], problems: [mosaic ? `The mosaic needs roughly ${probe} parts but the limit is ${LIMITS.maxParts}. ${advice}` : `The model needs roughly ${probe} parts but the limit is ${LIMITS.maxParts}. Biggest: ${biggestShapes(probeParts, grid, spec)}. Make those smaller, use hollow:true, or replace curved shapes (much more expensive than boxes) with boxes.`] };
+  }
+  const { parts, res } = assemble(spec, grid, bestPack(grid).parts, opts);
   const errs = res.errors.map((e) => e.message);
-  if (parts.length > LIMITS.maxParts) errs.unshift(`The model needs ${parts.length} parts but the limit is ${LIMITS.maxParts}. Biggest: ${biggestShapes(parts, grid, spec)}. Make those smaller or hollow (hollow:true), or use boxes instead of curved shapes.`);
+  if (parts.length > LIMITS.maxParts) errs.unshift(mosaic ? `The mosaic needs ${parts.length} parts but the limit is ${LIMITS.maxParts}. ${advice}` : `The model needs ${parts.length} parts but the limit is ${LIMITS.maxParts}. Biggest: ${biggestShapes(parts, grid, spec)}. Make those smaller or hollow (hollow:true), or use boxes instead of curved shapes.`);
   const stepData = res.ok ? makeSteps(parts, res.an) : null;
   if (res.ok && !stepData) errs.push('No valid build order exists.');
-  let model = { name: spec.name, spec, raw, mosaic: !!(spec.shapes[0] && spec.shapes[0].label === 'mosaic'), grid, parts, check: res, steps: stepData ? stepData.steps : [], list: partsList(parts) };
+  const model = {
+    name: spec.name, spec, raw, mosaic, grid, parts, check: res, steps: stepData ? stepData.steps : [], list: partsList(parts),
+    opts: { tiles: !!opts.tiles, baseplate: !!opts.baseplate, commonOnly: !!opts.commonOnly },
+  };
   const ok = errs.length === 0;
   if (!ok && opts.prune) {
     const pruned = pruneLoose(model);
@@ -156,16 +167,18 @@ function finish(spec, grid, raw, opts) {
 /** Last resort after the AI failed to fix a model: keep the biggest connected group (by volume), drop the rest. */
 export function pruneLoose(model) {
   const { grid, spec, check: res } = model;
+  const opts = model.opts || {};
   if (res.stats.components < 2) return null;
+  const real = (p) => p.kind !== 'baseplate'; // the baseplate is not part of the design: never count or drop it
   const vol = new Array(res.an.nComp).fill(0);
-  model.parts.forEach((p, i) => { vol[res.an.comp[i]] += p.w * p.d * p.h; });
+  model.parts.forEach((p, i) => { if (real(p)) vol[res.an.comp[i]] += p.w * p.d * p.h; });
   const total = vol.reduce((a, b) => a + b, 0);
   const main = vol.indexOf(Math.max(...vol));
   const dropped = Math.round((100 * (total - vol[main])) / total);
   if (dropped > 50) return null; // would delete most of the model: better to fail loudly than to show a stump
   const cells = grid.cells.slice(), owner = grid.owner.slice(), slope = grid.slope ? grid.slope.slice() : new Uint8Array(cells.length);
   model.parts.forEach((p, i) => {
-    if (res.an.comp[i] === main) return;
+    if (!real(p) || res.an.comp[i] === main) return;
     for (let j = p.y; j < p.y + p.h; j++) for (let k = p.z; k < p.z + p.d; k++) for (let x = p.x; x < p.x + p.w; x++) { const a = (j * grid.D + k) * grid.W + x; cells[a] = 0; owner[a] = -1; slope[a] = 0; }
   });
   // crop to what is left so the model sits on layer 0 again
@@ -173,8 +186,8 @@ export function pruneLoose(model) {
   if (t.empty) return null;
   const g2 = { ...t, offset: [0, 1, 2].map((n) => (grid.offset ? grid.offset[n] : 0) + t.offset[n]), effect: grid.effect, hollowNoop: grid.hollowNoop };
   if (grid.slopePhase !== undefined) g2.slopePhase = (((grid.slopePhase - t.offset[1]) % 3) + 3) % 3;
-  const { parts } = bestPack(g2, { budgetMs: 1200 }); // the prune path already spent the full search once
-  const r2 = check(g2, parts, spec);
+  const packed = bestPack(g2, { budgetMs: 1200 }).parts; // the prune path already spent the full search once
+  const { parts, res: r2 } = assemble(spec, g2, packed, opts); // same tiles / baseplate / warnings as an unpruned model
   if (!r2.ok || parts.length > LIMITS.maxParts) return null;
   const sd = makeSteps(parts, r2.an);
   if (!sd) return null;

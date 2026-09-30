@@ -8,6 +8,7 @@ import { studCells, partNo, hasTile } from '../src/engine/parts.js';
 import { COLORS, isCommon } from '../src/engine/palette.js';
 import { PRESETS } from '../src/presets/index.js';
 import { requestSpec, readStream, extractJson, fetchRetry, testKey, generate, NoModelError } from '../src/ai/claude.js';
+import { systemPrompt, TOOL } from '../src/ai/prompt.js';
 
 const box = (color, pos, size, extra = {}) => ({ shape: 'box', color, pos, size, ...extra });
 const roofHouse = (over = {}) => ({
@@ -487,5 +488,151 @@ describe('Anthropic client', () => {
     let n = 0;
     const abort = Object.assign(new Error('Aborted'), { name: 'AbortError' });
     await expect(generate({ prompt: 'x', key: 'k', model: 'm', request: async () => { if (++n === 2) throw abort; return { name: 't', footprint: [10, 2], shapes: [box('Red', [0, 0, 0], [2, 3, 2]), box('Blue', [6, 0, 0], [2, 3, 2])] }; } })).rejects.toThrow(/Abort/);
+  });
+});
+
+describe('review round 2', () => {
+  const towers = (n) => ({ footprint: [n * 4, 2], shapes: Array.from({ length: n }, (_, i) => box(['Red', 'Blue', 'Yellow'][i % 3], [i * 4, 0, 0], [2, 3, 2])) });
+  const okStream = (spec) => {
+    const enc = new TextEncoder();
+    const ev = (e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`;
+    const txt = ev({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 't', name: 'submit_model', input: {} } })
+      + ev({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(spec) } })
+      + ev({ type: 'message_delta', delta: { stop_reason: 'tool_use' } }) + ev({ type: 'message_stop' });
+    return { ok: true, status: 200, headers: new Headers(), body: new ReadableStream({ start(c) { c.enqueue(enc.encode(txt)); c.close(); } }) };
+  };
+  const rawStream = (txt) => ({ ok: true, status: 200, headers: new Headers(), body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(txt)); c.close(); } }) });
+  const good = { name: 'x', footprint: [2, 2], shapes: [box('Red', [0, 0, 0], [2, 1, 2])] };
+
+  it('two overlapping roofs never produce fake slope parts (every slope has a direction and a real size)', () => {
+    const r = buildModel({ footprint: [10, 14], shapes: [box('White', [0, 0, 0], [10, 2, 14], { hollow: true }), { shape: 'roof', axis: 'x', color: 'Blue', pos: [1, 2, 2], size: [8, 2, 11] }, { shape: 'roof', axis: 'z', color: 'Tan', pos: [3, 2, 0], size: [6, 2, 10] }] });
+    const parts = (r.model || {}).parts || [];
+    parts.filter((p) => p.kind === 'slope').forEach((p) => {
+      expect([1, 2, 3, 4]).toContain(p.dir);
+      expect(Math.max(p.w, p.d)).toBe(2);
+      expect([1, 2]).toContain(Math.min(p.w, p.d));
+      expect(studCells(p).length).toBe(Math.min(p.w, p.d));
+    });
+    if (r.ok) { const an = analyze(r.model.grid, r.model.parts); expect(an.nComp).toBe(1); }
+  });
+
+  it('pruning ignores the baseplate when choosing what to keep, and keeps tiles, baseplate and warnings', () => {
+    const spec = { footprint: [20, 8], shapes: [box('Red', [0, 0, 0], [4, 1, 4]), box('Blue', [8, 3, 0], [10, 3, 6])] };
+    const r = buildModel(spec, { baseplate: true, prune: true });
+    expect(r.ok).toBe(true);
+    expect(r.pruned).toBe(true);
+    expect(r.model.parts.some((p) => p.kind === 'baseplate')).toBe(true);
+    const keptBlue = r.model.parts.filter((p) => p.kind !== 'baseplate').some((p) => p.w * p.d * p.h >= 20 && p.color === COLORS.findIndex((c) => c.name === 'Blue'));
+    expect(keptBlue).toBe(true); // the big group survived, not the small one
+    const plates = { footprint: [12, 12], shapes: [box('Red', [0, 0, 0], [6, 0.667, 6]), box('Blue', [8, 3, 8], [2, 1, 2])] };
+    const t = buildModel(plates, { tiles: true, baseplate: true, prune: true });
+    expect(t.ok).toBe(true);
+    expect(t.pruned).toBe(true);
+    expect(t.model.check.stats.baseplate).toBe(true);
+    expect(t.model.opts).toMatchObject({ tiles: true, baseplate: true });
+  });
+
+  it('a stack of joints under one overhang gives one warning, and a second overhang is still reported', () => {
+    const r = buildModel({ footprint: [40, 8], shapes: [
+      box('Red', [0, 0, 0], [2, 5, 2]), box('Blue', [0, 5, 0], [14, 1, 8]),
+      box('Yellow', [24, 0, 0], [2, 2, 2]), box('Green', [24, 2, 0], [12, 1, 8]),
+    ] }, { baseplate: true });
+    expect(r.ok).toBe(true);
+    const side = r.warnings.filter((w) => /rests on only|hangs/.test(w));
+    expect(side.length).toBeGreaterThanOrEqual(2);
+    expect(side.length).toBeLessThanOrEqual(3);
+    expect(side.some((w) => /near x [0-3],/.test(w))).toBe(true);
+    expect(side.some((w) => /near x 2[4-9],/.test(w))).toBe(true);
+  });
+
+  it('a slope placed at half-stud positions stays inside the footprint', () => {
+    const { spec } = validateSpec({ footprint: [4, 2], shapes: [{ shape: 'slope', dir: '+x', color: 'Red', pos: [0.5, 0, 0], size: [3, 1, 2] }] });
+    const g = voxelize(spec);
+    expect(g.W).toBe(3);
+    expect(g.cells.filter(Boolean).length).toBeGreaterThan(0);
+  });
+
+  describe('mosaic', () => {
+    const noise = (w, h) => { const d = new Uint8ClampedArray(w * h * 4); let s = 5; for (let i = 0; i < w * h; i++) { s = (s * 1664525 + 1013904223) >>> 0; d.set([s & 255, (s >> 8) & 255, (s >> 16) & 255, 255], i * 4); } return { width: w, height: h, data: d }; };
+    it('a tall picture is narrowed, not squashed', () => {
+      const { grid } = mosaicGrid(noise(100, 400), { cols: 32 });
+      expect(grid.D).toBe(48);
+      expect(Math.abs(grid.W / grid.D - 100 / 400)).toBeLessThan(0.03);
+    });
+    it('too many parts gives a mosaic-specific message (no shape or hollow advice)', () => {
+      const { grid } = mosaicGrid(noise(100, 100), { cols: 48 });
+      const r = buildFromGrid(grid, 'Photo mosaic', {});
+      expect(r.ok).toBe(false);
+      expect(r.problems[0]).toMatch(/The mosaic needs .* parts but the limit is 1500\. Choose fewer studs/);
+      expect(r.problems[0]).not.toMatch(/Biggest|hollow|curved/);
+    });
+    it('turning dithering off (or fewer studs) fits the limit', () => {
+      const { grid } = mosaicGrid(noise(100, 100), { cols: 32, dither: false });
+      expect(buildFromGrid(grid, 'Photo mosaic', {}).ok).toBe(true);
+    });
+    it('an AI spec whose first shape is labelled "mosaic" is a normal model, not a photo mosaic', () => {
+      const r = buildModel({ footprint: [4, 4], shapes: [box('Red', [0, 0, 0], [4, 1, 4], { label: 'mosaic' })] });
+      expect(r.ok).toBe(true);
+      expect(r.model.mosaic).toBe(false);
+    });
+  });
+
+  describe('client', () => {
+    it('a cut-off reply is not mistaken for an inner shape object', async () => {
+      const cut = '{"name":"x","footprint":[2,2],"shapes":[{"shape":"box","color":"Red","pos":[0,0,0],"size":[1,1,1]},{"shape":"bo';
+      const txt = `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Sure: ' + cut } })}\n\nevent: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'max_tokens' } })}\n\n`;
+      await expect(requestSpec({ key: 'k', model: 'm', messages: [], fetchFn: async () => rawStream(txt) })).rejects.toMatchObject({ name: 'NoModelError', kind: 'cut-off' });
+    });
+    it('an overloaded_error inside a 200 stream is retried like an HTTP 529', async () => {
+      vi.useFakeTimers();
+      let n = 0; const seen = [];
+      const overloaded = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } })}\n\n`;
+      const p = requestSpec({ key: 'k', model: 'm', messages: [], onRetry: (a, why) => seen.push(why), fetchFn: async () => (++n === 1 ? rawStream(overloaded) : okStream(good)) });
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(await p).toEqual(good);
+      expect(n).toBe(2);
+      expect(seen).toEqual(['stream']);
+      vi.useRealTimers();
+    });
+    it('a stream cut before message_stop is retried, and is not reported as "answered in words"', async () => {
+      vi.useFakeTimers();
+      let n = 0;
+      const cutStream = `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 't', name: 'submit_model', input: {} } })}\n\nevent: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"name":"x","footprint":[2,2],"shapes":[{"sha' } })}\n\n`;
+      const p = requestSpec({ key: 'k', model: 'm', messages: [], fetchFn: async () => (++n === 1 ? rawStream(cutStream) : okStream(good)) });
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(await p).toEqual(good);
+      expect(n).toBe(2);
+      vi.useRealTimers();
+    });
+    it('a non-retryable stream error (invalid request) is not retried', async () => {
+      let n = 0;
+      const bad = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'nope' } })}\n\n`;
+      await expect(requestSpec({ key: 'k', model: 'm', messages: [], fetchFn: async () => { n++; return rawStream(bad); } })).rejects.toThrow(/nope/);
+      expect(n).toBe(1);
+    });
+    it('after a late API failure the BEST earlier attempt is used, not the latest', async () => {
+      const better = { name: 'Better', ...towers(2), shapes: [box('Red', [0, 0, 0], [2, 3, 2]), box('Blue', [4, 0, 0], [1, 1, 1])] };
+      const worse = { name: 'Worse', ...towers(3) };
+      let n = 0; const ev = [];
+      const res = await generate({ prompt: 'x', key: 'k', model: 'm', onEvent: (e) => ev.push(e), request: async () => { n++; if (n === 3) throw new Error('Anthropic API 529: overloaded'); return n === 1 ? better : worse; } });
+      expect(res.ok).toBe(true);
+      expect(res.spec.name).toBe('Better');
+      expect(res.rounds).toBe(1);
+      expect(res.apiFailure).toMatch(/529/);
+      const fb = ev.find((e) => e.type === 'fallback');
+      expect(fb).toMatchObject({ fromRound: 1, pruned: true });
+    });
+  });
+
+  describe('prompt states only true engine facts', () => {
+    it('hollow threshold and cone cost match the engine', () => {
+      const prompt = systemPrompt({});
+      expect(JSON.stringify(TOOL)).toMatch(/MORE than 2 bricks tall \(7\+ plates\)/);
+      expect(prompt).toMatch(/hollow cone about 80 and 240/);
+      const vox = (h) => { const { spec } = validateSpec({ footprint: [10, 10], shapes: [box('Red', [0, 0, 0], [10, h, 10], { hollow: true })] }); return voxelize(spec); };
+      const floor = (g) => { let n = 0; for (let k = 0; k < g.D; k++) for (let i = 0; i < g.W; i++) if (g.cells[k * g.W + i]) n++; return n; };
+      expect(floor(vox(2))).toBe(36); // exactly 2 bricks: walls only (10x10 ring = 36 cells)
+      expect(floor(vox(2.333))).toBe(100); // 7 plates: floor and roof appear
+    });
   });
 });

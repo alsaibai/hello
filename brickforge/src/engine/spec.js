@@ -127,7 +127,7 @@ export function voxelize(spec) {
   const [FW, FD] = spec.footprint;
   const W = Math.ceil(FW - 1e-9), D = Math.ceil(FD - 1e-9);
   let topBricks = 0;
-  spec.shapes.forEach((s) => { topBricks = Math.max(topBricks, s.pos[1] + (s.shape === 'roof' ? Math.round(s.size[1]) + 1 / 3 : s.size[1])); });
+  spec.shapes.forEach((s) => { topBricks = Math.max(topBricks, s.pos[1] + (s.shape === 'roof' ? Math.max(1, Math.round(s.size[1])) + 1 / 3 : s.shape === 'slope' ? Math.max(1, Math.round(s.size[1])) : s.size[1])); });
   const H = Math.max(1, Math.ceil(topBricks * 3 - 1e-9));
   const cells = new Uint8Array(W * H * D), owner = new Int16Array(W * H * D).fill(-1);
   const slope = new Uint8Array(W * H * D); // 0, or DIR_CODE of a slope-low cell (the slanted half of a slope part)
@@ -147,7 +147,7 @@ export function voxelize(spec) {
   // = that low cell + the high cell (level c-1 of column c+1) next to it, so the packer can pair them.
   const rasterSlope = (s, idx) => {
     const i0 = Math.round(s.pos[0]), k0 = Math.round(s.pos[2]);
-    const nx = Math.max(1, Math.round(s.size[0])), nz = Math.max(1, Math.round(s.size[2]));
+    const nx = Math.max(1, Math.round(s.pos[0] + s.size[0]) - i0), nz = Math.max(1, Math.round(s.pos[2] + s.size[2]) - k0); // rounded edges, so a shape that validates inside the footprint stays inside
     const y0 = Math.round(s.pos[1] * 3), Hb = Math.max(1, Math.round(s.size[1]));
     phases.add(((y0 % 3) + 3) % 3);
     const put = (i0_, k0_, level, low, dirCode) => {

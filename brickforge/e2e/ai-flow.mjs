@@ -34,7 +34,8 @@ await page.route('https://api.anthropic.com/**', async (route) => {
   requests.push({ headers: req.headers(), body });
   if (mode === 'badkey') return route.fulfill({ status: 401, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }) });
   if (mode === 'busy' && requests.length === 1) return route.fulfill({ status: 529, headers: { ...cors, 'content-type': 'application/json', 'retry-after': '1' }, body: '{"error":{"message":"Overloaded"}}' });
-  const spec = mode === 'repair' && requests.length === 1 ? broken : fixedSpec;
+  if (mode === 'slow') await new Promise((r) => setTimeout(r, 1200));
+  const spec = mode === 'loose3' ? broken : mode === 'repair' && requests.length === 1 ? broken : fixedSpec;
   return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/event-stream' }, body: sse(spec) });
 });
 
@@ -93,6 +94,26 @@ await page.waitForSelector('[data-testid=log] .ok', { timeout: 30000 });
 const busyLog = await page.textContent('[data-testid=log]');
 ok('529 is retried and the log says so', /API busy \(529\), retrying/.test(busyLog) && requests.length === 2, busyLog.replace(/\s+/g, ' ').slice(0, 160));
 await page.screenshot({ path: 'shots/ai-4b-retry.png' });
+
+// 2a) options are locked while Claude works, and a result that needed loose bits removed keeps working with options
+requests.length = 0; mode = 'slow';
+await page.fill('[data-testid=prompt]', 'slow tower');
+await page.click('[data-testid=generate]'); await settle(page, 300);
+ok('option checkboxes are disabled while generating', await page.isDisabled('[data-testid=opt-tiles]') && await page.isDisabled('[data-testid=opt-base]'));
+await page.waitForSelector('[data-testid=log] .ok', { timeout: 30000 });
+ok('...and enabled again afterwards', !(await page.isDisabled('[data-testid=opt-tiles]')));
+requests.length = 0; mode = 'loose3';
+await page.fill('[data-testid=prompt]', 'twin towers that never get joined');
+await page.click('[data-testid=generate]');
+await page.waitForSelector('[data-testid=log] .ok', { timeout: 40000 });
+const prunedCrumb = await page.textContent('[data-testid=crumb]');
+ok('3 failed rounds end in a pruned result, labelled as such', requests.length === 3 && /loose pieces removed/.test(prunedCrumb), prunedCrumb);
+await page.click('[data-testid=opt-base]'); await settle(page, 1800);
+ok('toggling an option on a pruned result rebuilds it (no "failed its checks" error)', !(await page.isVisible('[data-testid=error]')) && /loose pieces removed/.test(await page.textContent('[data-testid=crumb]')), (await page.textContent('[data-testid=crumb]')));
+await page.click('[data-testid=tab-parts]'); await settle(page, 300);
+ok('...and the baseplate is in the parts list', /Baseplate 16×16/.test(await page.textContent('[data-testid=parts-table]')));
+await page.click('[data-testid=opt-base]'); await settle(page, 1200);
+mode = 'ok';
 
 // 2c) test key button
 await page.click('[data-testid=key-btn]');

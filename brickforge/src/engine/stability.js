@@ -85,11 +85,18 @@ export function stability(parts, an, off = [0, 0, 0]) {
     const lever = upperInLoad ? distToHull([load.gx, load.gz], contact) : Math.hypot(load.gx - jx, load.gz - jz);
     const torque = load.m * lever, capacity = 5 * e.studs;
     if (lever > 1 && torque > capacity) {
-      scored.push({ torque, msg: upperInLoad
+      scored.push({ torque, jx, jz, msg: upperInLoad
         ? `A group of ${load.cnt} parts rests on only ${e.studs} stud${e.studs === 1 ? '' : 's'} near x ${Math.round(jx + off[0])}, z ${Math.round(jz + off[2])} with its weight ${Math.round(lever * 10) / 10} studs off to the side, so it may tip off. Give it a wider seat.`
         : `A group of ${load.cnt} parts hangs ${Math.round(lever * 10) / 10} studs off-centre from ${e.studs} stud${e.studs === 1 ? '' : 's'} near x ${Math.round(jx + off[0])}, z ${Math.round(jz + off[2])}. It is likely to sag or twist off; add support or overlap more.` });
     }
   }
-  scored.sort((a, b) => b.torque - a.torque).slice(0, 3).forEach((s) => warnings.push({ code: 'sideways', message: s.msg }));
+  // one warning per cause: a stack of bricks under one overhang produces a candidate per joint, keep only the worst nearby
+  const chosen = [];
+  for (const c of scored.sort((a, b) => b.torque - a.torque)) {
+    if (chosen.some((k) => Math.hypot(k.jx - c.jx, k.jz - c.jz) < 3)) continue;
+    chosen.push(c);
+    if (chosen.length === 3) break;
+  }
+  chosen.forEach((c) => warnings.push({ code: 'sideways', message: c.msg }));
   return { warnings, com };
 }
