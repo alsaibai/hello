@@ -14,5 +14,7 @@ export default defineConfig({
   base: './',
   build: { chunkSizeWarningLimit: 900 },
   worker: { format: 'es' },
+  server: { port: 3000, host: true },   // dev: http://localhost:3000 (Vite moves to the next free port if it is taken)
+  preview: { port: 3000 },
   test: { include: ['tests/**/*.test.js'] },
 });
